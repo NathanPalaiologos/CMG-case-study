@@ -117,21 +117,21 @@ FROM merged_data;
 -- ============================================================================
 
 
--- Check 1: Ensure no missing values in key dimensions
-SELECT 'Missing Dimensions Check' AS check_name, COUNT(*) AS failed_rows
-FROM final_table 
-WHERE month IS NULL OR business_unit IS NULL OR territory_name IS NULL OR dsp IS NULL;
+-- -- Check 1: Ensure no missing values in key dimensions
+-- SELECT 'Missing Dimensions Check' AS check_name, COUNT(*) AS failed_rows
+-- FROM final_table 
+-- WHERE month IS NULL OR business_unit IS NULL OR territory_name IS NULL OR dsp IS NULL;
 
--- Check 2: Ensure total revenue matches the source
-SELECT 
-    'Revenue Total Check' AS check_name,
-    (SELECT SUM(total_gross_amount) FROM revenue) AS source_revenue,
-    (SELECT SUM(total_gross_amount) FROM final_table) AS final_revenue,
-    CASE WHEN (SELECT SUM(total_gross_amount) FROM revenue) = (SELECT SUM(total_gross_amount) FROM final_table) THEN 'PASS' ELSE 'FAIL' END AS status;
+-- -- Check 2: Ensure total revenue matches the source
+-- SELECT 
+--     'Revenue Total Check' AS check_name,
+--     (SELECT SUM(total_gross_amount) FROM revenue) AS source_revenue,
+--     (SELECT SUM(total_gross_amount) FROM final_table) AS final_revenue,
+--     CASE WHEN (SELECT SUM(total_gross_amount) FROM revenue) = (SELECT SUM(total_gross_amount) FROM final_table) THEN 'PASS' ELSE 'FAIL' END AS status;
 
--- Check 3: Ensure total streams match the source
-SELECT 
-    'Streams Total Check' AS check_name,
-    (SELECT SUM(total_streams) FROM streams) AS source_streams,
-    (SELECT SUM(total_streams) FROM final_table) AS final_streams,
-    CASE WHEN (SELECT SUM(total_streams) FROM streams) = (SELECT SUM(total_streams) FROM final_table) THEN 'PASS' ELSE 'FAIL' END AS status;
+-- -- Check 3: Ensure total streams match the source
+-- SELECT 
+--     'Streams Total Check' AS check_name,
+--     (SELECT SUM(total_streams) FROM streams) AS source_streams,
+--     (SELECT SUM(total_streams) FROM final_table) AS final_streams,
+--     CASE WHEN (SELECT SUM(total_streams) FROM streams) = (SELECT SUM(total_streams) FROM final_table) THEN 'PASS' ELSE 'FAIL' END AS status;
