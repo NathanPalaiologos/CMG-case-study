@@ -50,6 +50,7 @@ def harmonize_with_sql(
     duckdb = _get_duckdb()
     con = duckdb.connect(database=":memory:")
 
+    # Input mode A: large-data friendly CSV path (SQL reads files directly).
     if revenue_csv and streams_csv:
         con.execute(
             """
@@ -65,6 +66,7 @@ def harmonize_with_sql(
             """,
             [str(streams_csv)],
         )
+    # Input mode B: case-study Excel path (load once, register as SQL views).
     elif source_xlsx:
         revenue_df = pd.read_excel(source_xlsx, sheet_name="Revenue")
         streams_df = pd.read_excel(source_xlsx, sheet_name="Streams")
@@ -73,7 +75,8 @@ def harmonize_with_sql(
     else:
         raise ValueError("Provide either --input-xlsx or both --revenue-csv and --streams-csv")
 
-    # SQL transformation is intentionally explicit for human auditability.
+    # This SQL is intentionally verbose so reviewers can audit every transformation step.
+    # Flow: standardize labels -> aggregate -> align territories -> full join -> add flags.
     query = """
     WITH revenue_standardized AS (
         SELECT
@@ -166,6 +169,8 @@ def harmonize_with_sql(
 
 def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Run quality flags, nowcast selected rows, and return final table + suspicious rows + summary."""
+    # Step 1) First-pass quality flags on harmonized data.
+    # These flags identify suspicious low-revenue rows using local cohort comparison.
     work_df = add_quality_flags(
         merged_df,
         stream_col=STREAM_COL,
@@ -174,10 +179,14 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         low_revenue_threshold=LOW_REVENUE_THRESHOLD,
     )
 
+    # Step 2) Define rows that should be estimated.
+    # - missing/zero revenue rows
+    # - strict quality-correction rows
     target_mask = (work_df["is_na"] == 1) | (work_df["is_zero"] == 1)
     quality_mask = work_df["quality_flag_low_revenue_high_streams"] == 1
     rows_to_nowcast = target_mask | quality_mask
 
+    # Step 3) Build lag features and re-flag on lag frame for consistent training filters.
     lag_df = add_lag_features(
         data=work_df,
         group_cols=GROUP_COLS,
@@ -193,6 +202,8 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         low_revenue_threshold=LOW_REVENUE_THRESHOLD,
     )
 
+    # Step 4) Train only on cleaner known rows.
+    # We intentionally exclude missing/zero rows and strict quality-flag rows from training.
     train_mask = (
         (lag_df["is_na"] == 0)
         & (lag_df["is_zero"] == 0)
@@ -203,6 +214,7 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     train_df = lag_df.loc[train_mask].copy()
     score_df = lag_df.loc[rows_to_nowcast].copy()
 
+    # Step 5) Run final nowcast model on selected rows.
     score_df["nowcast_pred"] = fit_predict_lag_hier_nowcast(
         train_data=train_df,
         score_data=score_df,
@@ -211,6 +223,8 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         target_col=TARGET_COL,
     )
 
+    # Step 6) Build final revenue field and transparent status labels.
+    # `filled_revenue` is the single value downstream users should consume.
     final_df = work_df.copy()
     final_df["filled_revenue"] = final_df[TARGET_COL]
     final_df.loc[score_df.index, "filled_revenue"] = score_df["nowcast_pred"].values
@@ -222,12 +236,14 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         default="reported_actual",
     )
 
+    # Step 7) Create RPS in business-friendly units (revenue per 1M streams).
     final_df["rps"] = np.where(
         final_df[STREAM_COL] > 0,
         final_df["filled_revenue"] / (final_df[STREAM_COL] / 1_000_000),
         np.nan,
     )
 
+    # Keep only delivery columns required by Finance and audit reviewers.
     deliverable_cols = [
         "month",
         "business_unit",
@@ -243,7 +259,9 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     ]
     final_df = final_df[deliverable_cols].copy()
 
-    # Final audit: hard-invalid checks + robust global RPS outlier checks.
+    # Step 8) Final audit:
+    #   A) hard-invalid checks (domain validity)
+    #   B) robust outlier checks using MAD on log-RPS
     audit_df = final_df.copy()
     log_rps = np.log1p(audit_df["rps"].replace([np.inf, -np.inf], np.nan))
     med = np.nanmedian(log_rps)
@@ -261,6 +279,7 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     )
     suspicious = audit_df[(~hard_invalid) & (audit_df["robust_z_all"].abs() > 5.5)].copy()
 
+    # Step 9) Compact run summary for monitoring and handoff.
     summary = {
         "rows_total": int(len(final_df)),
         "rows_nowcasted": int((final_df["value_status"] == "nowcasted").sum()),
@@ -286,9 +305,13 @@ def main() -> None:
     parser.add_argument("--refresh-merged", action="store_true")
     args = parser.parse_args()
 
+    # Convention: run from repo root. Outputs always land in ./data.
     root = Path.cwd()
     data_dir = root / "data"
 
+    # Data ingestion mode:
+    # - refresh_merged: rebuild harmonized dataset with SQL from source files
+    # - otherwise: use existing merged_data.csv for a fast run
     if args.refresh_merged:
         merged_df = harmonize_with_sql(
             revenue_csv=Path(args.revenue_csv) if args.revenue_csv else None,
@@ -299,6 +322,7 @@ def main() -> None:
     else:
         merged_df = pd.read_csv(root / args.input_merged)
 
+    # Run modeling + audit pipeline.
     final_df, suspicious_df, summary = run_nowcast_and_audit(merged_df)
 
     final_csv = data_dir / "imputed_revenue_lag-aware_hierarchical_nowcast.csv"
@@ -306,6 +330,7 @@ def main() -> None:
     suspicious_csv = data_dir / "output_audit_suspicious_rows.csv"
     run_summary_json = data_dir / "pipeline_run_summary.json"
 
+    # Persist outputs used by finance consumers and QA reviewers.
     final_df.to_csv(final_csv, index=False)
     final_df.to_excel(final_xlsx, index=False, engine="openpyxl")
     suspicious_df.to_csv(suspicious_csv, index=False)

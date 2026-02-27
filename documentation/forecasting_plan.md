@@ -200,7 +200,7 @@ This gives a clear, controlled path from robust simple strategy (EPSR) to produc
 ## 6) Case-Study Deliverable Output (Implemented)
 
 The notebook now builds a full imputed dataframe with explicit labels and saves it to:
-- `data/final_imputed_revenue_lag-aware_hierarchical_nowcast.csv`
+- `data/imputed_revenue_lag-aware_hierarchical_nowcast.csv`
 
 ### Simplified deliverable fields
 - `month`, `business_unit`, `territory_name`, `dsp`
@@ -214,7 +214,7 @@ The notebook now builds a full imputed dataframe with explicit labels and saves 
 
 ### Revenue per million streams (RPS)
 \[
-  ext{RPS} = \frac{\text{filled\_revenue}}{\text{total\_streams}/1{,}000{,}000}
+	ext{RPS} = \frac{\text{filled\_revenue}}{\text{total\_streams}/1{,}000{,}000}
 \]
 
 RPS is set to `NaN` when streams are zero/non-positive.

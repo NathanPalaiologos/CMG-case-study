@@ -7,7 +7,7 @@ This audit compares the current repository outputs against the case-study requir
 
 ### 1) Provide actual revenue by DSP / BU / territory (Jan-Oct 2025)
 - **Status:** ✅ Completed
-- **Evidence:** `data/final_imputed_revenue_lag-aware_hierarchical_nowcast.csv` includes the reported value in `total_gross_amount` where available.
+- **Evidence:** `data/imputed_revenue_lag-aware_hierarchical_nowcast.csv` includes the reported value in `total_gross_amount` where available.
 
 ### 2) Estimate revenue where unavailable / incomplete, with actual-vs-forecast indicator
 - **Status:** ✅ Completed

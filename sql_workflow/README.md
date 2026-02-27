@@ -49,7 +49,7 @@ python sql_workflow/build_finance_revenue_view.py --refresh-merged --revenue-csv
 
 ## Outputs
 - `data/merged_data.csv` (when `--refresh-merged` is used)
-- `data/final_imputed_revenue_lag-aware_hierarchical_nowcast.csv`
-- `data/final_imputed_revenue_lag-aware_hierarchical_nowcast.xlsx`
-- `data/final_output_audit_suspicious_rows.csv`
+- `data/imputed_revenue_lag-aware_hierarchical_nowcast.csv`
+- `data/imputed_revenue_lag-aware_hierarchical_nowcast.xlsx`
+- `data/output_audit_suspicious_rows.csv`
 - `data/pipeline_run_summary.json`

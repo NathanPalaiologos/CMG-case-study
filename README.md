@@ -26,13 +26,14 @@ python sql_workflow/build_finance_revenue_view.py --refresh-merged --input-xlsx 
 ```
 
 ## Main Outputs
-- `data/final_imputed_revenue_lag-aware_hierarchical_nowcast.csv`
-- `data/final_imputed_revenue_lag-aware_hierarchical_nowcast.xlsx`
+- `data/imputed_revenue_lag-aware_hierarchical_nowcast.csv`
+- `data/imputed_revenue_lag-aware_hierarchical_nowcast.xlsx`
+- `data/output_audit_suspicious_rows.csv`
 - `data/pipeline_run_summary.json`
 
 ## Documentation
-- `forecasting_plan.md`
-- `forecasting_methodology_log.md`
-- `misreporting_audit_report.md`
-- `final_project_audit.md`
-- `stakeholder_process_report.md`
+- `documentation/forecasting_plan.md`
+- `documentation/forecasting_methodology_log.md`
+- `documentation/misreporting_audit_report.md`
+- `documentation/final_project_audit.md`
+- `documentation/stakeholder_process_report.md`
