@@ -64,6 +64,20 @@ This vocabulary is used consistently across workflow outputs and documentation.
    - Produce final output fields.
    - Run hard-validity checks and robust RPS outlier checks.
 
+### Lag-Aware Hierarchical Nowcast mechanics (technical)
+The selected final rule combines three layers:
+1. **EPSR anchor**
+   - Generates structurally stable revenue from streams.
+2. **Lag-aware adjustment**
+   - Uses lag features (`gross_lag_1`, `streams_lag_1`, `epsr_lag_1`) to adapt to recent cohort shifts.
+3. **Bounded reconciliation**
+   - Applies constrained scaling at aggregation level to keep forecasts coherent while limiting extreme drift.
+
+Design intent:
+- anchor for robustness,
+- lag signal for responsiveness,
+- bounded reconciliation for consistency and governance.
+
 ---
 
 ## Candidate Models Evaluated
@@ -74,6 +88,26 @@ This vocabulary is used consistently across workflow outputs and documentation.
 - LightGBM refined
 - KNN refined
 - Lag-Aware Hierarchical Nowcast
+
+### Rule-by-rule pros and cons
+1. **Group Average**
+   - Pros: robust baseline; easy explainability.
+   - Cons: no temporal adaptation.
+2. **Naive lag-1**
+   - Pros: captures immediate momentum.
+   - Cons: sensitive to prior-month noise/gaps.
+3. **EPSR**
+   - Pros: transparent stream-rate mapping; strong governance benchmark.
+   - Cons: less responsive to short-term local structural shifts.
+4. **XGBoost / LightGBM**
+   - Pros: expressive nonlinear modeling.
+   - Cons: weaker stress stability and interpretability in this project context.
+5. **KNN**
+   - Pros: simple nonparametric fit.
+   - Cons: poor high-dimensional stability and weakest aggregate stress performance.
+6. **Lag-Aware Hierarchical Nowcast**
+   - Pros: blends stream anchor + lag signal + bounded reconciliation; strongest fit-to-risk balance.
+   - Cons: more moving parts than EPSR.
 
 ---
 
@@ -102,6 +136,33 @@ It reflects production-like missingness better than IID random splits and gives 
 
 ---
 
+## Prediction Interval Method (Reusable Utility)
+Utility function:
+- `utils/forecast_utils.py::build_relative_prediction_intervals`
+
+Construction steps:
+1. Build calibration set on clean known rows with model predictions.
+2. Compute absolute relative error:
+   \[
+   e_i = \frac{|y_i - \hat{y}_i|}{\max(|\hat{y}_i|, \epsilon)}
+   \]
+3. Learn uncertainty quantile at level \(1-\alpha\) (default 0.90), with group-level estimate (`territory_name`, `dsp`) and global fallback when sample size is small.
+4. For each nowcasted row, produce interval:
+   \[
+   	ext{lower} = \hat{y}(1-q),\quad \text{upper} = \hat{y}(1+q)
+   \]
+   with lower bound clipped at 0.
+
+Output columns (consistent in notebook + workflow):
+- `nowcast_lower_90`
+- `nowcast_upper_90`
+
+Interpretation:
+- Interval width is an uncertainty indicator.
+- Intervals are populated only for estimated rows (`value_status = nowcasted`).
+
+---
+
 ## Row Accounting (Current Verified Run)
 - Harmonized rows: `2000`
 - Missing/zero target rows: `286`
@@ -117,6 +178,7 @@ Interpretation: estimation is targeted, not blanket replacement.
 - `data/imputed_revenue_lag-aware_hierarchical_nowcast.csv`
 - `data/imputed_revenue_lag-aware_hierarchical_nowcast.xlsx`
 - `data/output_audit_suspicious_rows.csv`
+- `data/output_audit_dsp_month_reliability.csv`
 - `data/pipeline_run_summary.json`
 
 Required output fields:

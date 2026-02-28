@@ -8,12 +8,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Allow direct execution from project root: python sql_workflow/build_finance_revenue_view.py
+import duckdb
+
+# Allow direct execution from project root
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from utils.forecast_utils import add_lag_features, add_quality_flags
+from utils.forecast_utils import add_lag_features, add_quality_flags, build_relative_prediction_intervals
 from utils.model_utils import fit_predict_lag_hier_nowcast
 
 
@@ -22,17 +24,6 @@ STREAM_COL = "total_streams"
 GROUP_COLS = ["business_unit", "territory_name", "dsp"]
 LOW_REVENUE_THRESHOLD = 99.0
 LOW_RATIO_THRESHOLD = 0.20
-
-
-def _get_duckdb():
-    """Import DuckDB with a clear install hint for first-time users."""
-    try:
-        import duckdb
-    except ImportError as exc:
-        raise RuntimeError(
-            "DuckDB is required for SQL-based harmonization. Install with: pip install duckdb"
-        ) from exc
-    return duckdb
 
 
 def harmonize_with_sql(
@@ -47,7 +38,6 @@ def harmonize_with_sql(
     - keeps transformation logic auditable and close to the provided SQL script
     - scales better than row-wise Python for large tabular processing
     """
-    duckdb = _get_duckdb()
     con = duckdb.connect(database=":memory:")
 
     # Input mode A: large-data friendly CSV path (SQL reads files directly).
@@ -167,8 +157,8 @@ def harmonize_with_sql(
     return out
 
 
-def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Run quality flags, nowcast selected rows, and return final table + suspicious rows + summary."""
+def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Run quality flags, nowcast selected rows, and return final table + audits + summary."""
     # Step 1) First-pass quality flags on harmonized data.
     # These flags identify suspicious low-revenue rows using local cohort comparison.
     work_df = add_quality_flags(
@@ -223,17 +213,44 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         target_col=TARGET_COL,
     )
 
+    # Step 5b) Build prediction intervals from calibration residuals on known clean rows.
+    calibration_df = train_df.copy()
+    calibration_df['calibration_pred'] = fit_predict_lag_hier_nowcast(
+        train_data=train_df,
+        score_data=calibration_df.copy(),
+        group_cols=GROUP_COLS,
+        stream_col=STREAM_COL,
+        target_col=TARGET_COL,
+    )
+
+    score_df = build_relative_prediction_intervals(
+        calibration_df=calibration_df,
+        prediction_df=score_df,
+        pred_col='nowcast_pred',
+        actual_col=TARGET_COL,
+        calibration_pred_col='calibration_pred',
+        group_cols=['territory_name', 'dsp'],
+        alpha=0.10,
+        min_group_rows=30,
+        lower_col='nowcast_lower_90',
+        upper_col='nowcast_upper_90',
+    )
+
     # Step 6) Build final revenue field and transparent status labels.
     # `filled_revenue` is the single value downstream users should consume.
     final_df = work_df.copy()
     final_df["filled_revenue"] = final_df[TARGET_COL]
     final_df.loc[score_df.index, "filled_revenue"] = score_df["nowcast_pred"].values
+    final_df['nowcast_lower_90'] = np.nan
+    final_df['nowcast_upper_90'] = np.nan
+    final_df.loc[score_df.index, 'nowcast_lower_90'] = score_df['nowcast_lower_90'].values
+    final_df.loc[score_df.index, 'nowcast_upper_90'] = score_df['nowcast_upper_90'].values
 
     final_df["value_status"] = np.where(rows_to_nowcast, "nowcasted", "actual")
     final_df["nowcast_reason"] = np.select(
         [target_mask, quality_mask],
         ["missing_or_zero_revenue", "quality_flag_low_revenue_high_streams"],
-        default="reported_actual",
+        default="N/A",
     )
 
     # Step 7) Create RPS in business-friendly units (revenue per 1M streams).
@@ -252,9 +269,10 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         STREAM_COL,
         TARGET_COL,
         "filled_revenue",
+        "nowcast_lower_90",
+        "nowcast_upper_90",
         "value_status",
         "nowcast_reason",
-        "quality_flag_low_revenue_high_streams",
         "rps",
     ]
     final_df = final_df[deliverable_cols].copy()
@@ -279,6 +297,35 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     )
     suspicious = audit_df[(~hard_invalid) & (audit_df["robust_z_all"].abs() > 5.5)].copy()
 
+    # Step 8b) DSP-month reliability audit for stakeholder monitoring.
+    # Flags months with heavy nowcast dependency or wide uncertainty range.
+    dsp_month_audit = (
+        final_df.groupby(["month", "dsp"], dropna=False)
+        .agg(
+            total_streams=(STREAM_COL, "sum"),
+            revenue_mid=("filled_revenue", "sum"),
+            revenue_lower=("nowcast_lower_90", "sum"),
+            revenue_upper=("nowcast_upper_90", "sum"),
+            nowcast_rows=("value_status", lambda s: (s == "nowcasted").sum()),
+            total_rows=("value_status", "size"),
+        )
+        .reset_index()
+    )
+    dsp_month_audit = dsp_month_audit[dsp_month_audit["total_streams"] > 0].copy()
+    dsp_month_audit["rps_mid"] = dsp_month_audit["revenue_mid"] / (dsp_month_audit["total_streams"] / 1_000_000)
+    dsp_month_audit["nowcast_rate"] = dsp_month_audit["nowcast_rows"] / dsp_month_audit["total_rows"]
+    dsp_month_audit["uncertainty_width_pct"] = np.where(
+        dsp_month_audit["revenue_mid"] > 0,
+        (dsp_month_audit["revenue_upper"] - dsp_month_audit["revenue_lower"]) / dsp_month_audit["revenue_mid"] * 100,
+        np.nan,
+    )
+    dsp_month_audit["risk_flag"] = np.where(
+        (dsp_month_audit["nowcast_rate"] >= 0.80) | (dsp_month_audit["uncertainty_width_pct"] >= 35),
+        "caution",
+        "normal",
+    )
+    high_risk_count = int((dsp_month_audit["risk_flag"] == "caution").sum())
+
     # Step 9) Compact run summary for monitoring and handoff.
     summary = {
         "rows_total": int(len(final_df)),
@@ -286,12 +333,13 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         "rows_nowcasted_missing_or_zero": int((final_df["nowcast_reason"] == "missing_or_zero_revenue").sum()),
         "rows_nowcasted_quality_flag": int((final_df["nowcast_reason"] == "quality_flag_low_revenue_high_streams").sum()),
         "rows_actual": int((final_df["value_status"] == "actual").sum()),
-        "quality_flag_rows": int(final_df["quality_flag_low_revenue_high_streams"].sum()),
+        "quality_flag_rows": int(quality_mask.sum()),
         "hard_invalid_rows": int(hard_invalid.sum()),
         "severe_suspicious_rows": int(len(suspicious)),
+        "dsp_month_caution_rows": high_risk_count,
     }
 
-    return final_df, suspicious, summary
+    return final_df, suspicious, dsp_month_audit, summary
 
 
 def main() -> None:
@@ -323,17 +371,19 @@ def main() -> None:
         merged_df = pd.read_csv(root / args.input_merged)
 
     # Run modeling + audit pipeline.
-    final_df, suspicious_df, summary = run_nowcast_and_audit(merged_df)
+    final_df, suspicious_df, dsp_month_audit_df, summary = run_nowcast_and_audit(merged_df)
 
     final_csv = data_dir / "imputed_revenue_lag-aware_hierarchical_nowcast.csv"
     final_xlsx = data_dir / "imputed_revenue_lag-aware_hierarchical_nowcast.xlsx"
     suspicious_csv = data_dir / "output_audit_suspicious_rows.csv"
+    dsp_month_audit_csv = data_dir / "output_audit_dsp_month_reliability.csv"
     run_summary_json = data_dir / "pipeline_run_summary.json"
 
     # Persist outputs used by finance consumers and QA reviewers.
     final_df.to_csv(final_csv, index=False)
     final_df.to_excel(final_xlsx, index=False, engine="openpyxl")
     suspicious_df.to_csv(suspicious_csv, index=False)
+    dsp_month_audit_df.to_csv(dsp_month_audit_csv, index=False)
     run_summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print("Build completed.")

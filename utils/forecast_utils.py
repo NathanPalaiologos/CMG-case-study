@@ -26,21 +26,8 @@ def add_quality_flags(
     special handling in the modeling process.
     """
     out = data.copy()
+    out['_orig_index'] = out.index
     out['quality_flag_low_revenue_high_streams'] = 0
-
-    if stream_col is None:
-        stream_candidates = ['total_streams', 'streams', 'stream_count']
-        stream_col = next((col for col in stream_candidates if col in out.columns), None)
-
-    if target_col is None:
-        target_candidates = ['total_gross_amount', 'gross_revenue_usd', 'revenue']
-        target_col = next((col for col in target_candidates if col in out.columns), None)
-
-    if stream_col is None or target_col is None:
-        raise ValueError(
-            'add_quality_flags could not infer stream/target columns. '
-            'Pass stream_col and target_col explicitly.'
-        )
 
     known_mask = (
         (out['is_na'] == 0)
@@ -50,6 +37,8 @@ def add_quality_flags(
     )
 
     if known_mask.sum() == 0:
+        out = out.sort_values('_orig_index').set_index('_orig_index', drop=True)
+        out.index.name = data.index.name
         return out
 
     out.loc[known_mask, 'epsr_row'] = out.loc[known_mask, target_col] / out.loc[known_mask, stream_col]
@@ -93,6 +82,10 @@ def add_quality_flags(
     ]
     out = out.drop(columns=[c for c in drop_cols if c in out.columns])
 
+    # Preserve original index/order so downstream mask alignment remains stable.
+    out = out.sort_values('_orig_index').set_index('_orig_index', drop=True)
+    out.index.name = data.index.name
+
     return out
 
 def add_lag_features(
@@ -131,8 +124,7 @@ def evaluate_predictions(data: pd.DataFrame, target_col: str, pred_col: str, lab
     return {
         'Method': label,
         'MAE': mae,
-        'WMAPE': wmape,
-        'Rows': len(data)
+        'WMAPE': wmape
     }
 
 
@@ -250,14 +242,14 @@ def run_distribution_backtest(
     model_name: str = 'Model'
 ):
     """Run repeated month-distribution-aware holdout tests for one model function."""
+    
+    # Get random generator
     rng = np.random.default_rng(random_state)
 
     month_dist = target_pool['month'].value_counts(normalize=True).sort_index()
     month_dist = month_dist[month_dist.index.isin(set(known_pool['month'].unique()))]
 
-    if month_dist.empty:
-        raise ValueError('No overlapping months between known pool and target pool.')
-
+    # Normalize month
     month_dist = month_dist / month_dist.sum()
 
     holdout_ratio = len(target_pool) / (len(known_pool) + len(target_pool))
@@ -266,6 +258,7 @@ def run_distribution_backtest(
     overall_rows = []
     monthly_rows = []
 
+    # Iterate over repeats
     for repeat in range(1, n_repeats + 1):
         per_month_counts = np.floor(month_dist.values * holdout_size).astype(int)
         remainder = holdout_size - per_month_counts.sum()
@@ -283,7 +276,7 @@ def run_distribution_backtest(
 
         if len(sampled_idx) == 0:
             continue
-
+            
         test_df = known_pool.loc[sampled_idx].copy()
         train_df = known_pool.drop(index=sampled_idx).copy()
 
@@ -321,3 +314,67 @@ def run_distribution_backtest(
     monthly_df = pd.concat(monthly_rows, ignore_index=True) if monthly_rows else pd.DataFrame()
 
     return overall_df, monthly_df
+
+
+def build_relative_prediction_intervals(
+    calibration_df: pd.DataFrame,
+    prediction_df: pd.DataFrame,
+    pred_col: str,
+    actual_col: str,
+    calibration_pred_col: Optional[str] = None,
+    group_cols=None,
+    alpha: float = 0.10,
+    min_group_rows: int = 30,
+    lower_col: str = 'nowcast_lower_90',
+    upper_col: str = 'nowcast_upper_90',
+):
+    """
+    Build two-sided prediction intervals using absolute relative errors from a calibration set.
+
+    Method:
+    1) Compute calibration relative error: |actual - pred| / max(|pred|, 1e-6)
+    2) Take quantile q at (1 - alpha)
+    3) Interval for each prediction is pred * (1 +/- q), clipped at zero on lower bound
+
+    Supports group-level uncertainty by learning q per group with global fallback.
+    """
+    if group_cols is None:
+        group_cols = ['dsp']
+
+    cal = calibration_df.copy()
+    pred = prediction_df.copy()
+    pred['_orig_index'] = pred.index
+
+    if calibration_pred_col is None:
+        calibration_pred_col = pred_col
+
+    safe_pred = cal[calibration_pred_col].abs().clip(lower=1e-6)
+    cal['_rel_err'] = (cal[actual_col] - cal[calibration_pred_col]).abs() / safe_pred
+
+    global_q = cal['_rel_err'].quantile(1 - alpha)
+    if pd.isna(global_q):
+        global_q = 0.25
+
+    valid_group_cols = [c for c in group_cols if c in cal.columns and c in pred.columns]
+
+    if valid_group_cols:
+        group_q = (
+            cal.groupby(valid_group_cols)['_rel_err']
+            .agg(group_q=lambda s: s.quantile(1 - alpha), group_n='size')
+            .reset_index()
+        )
+        group_q.loc[group_q['group_n'] < min_group_rows, 'group_q'] = np.nan
+
+        pred = pred.merge(group_q[valid_group_cols + ['group_q']], on=valid_group_cols, how='left')
+        pred = pred.set_index('_orig_index', drop=True)
+        pred['_pi_q'] = pred['group_q'].fillna(global_q)
+        pred = pred.drop(columns=[c for c in ['group_q'] if c in pred.columns])
+    else:
+        pred = pred.set_index('_orig_index', drop=True)
+        pred['_pi_q'] = global_q
+
+    pred[lower_col] = (pred[pred_col] * (1 - pred['_pi_q'])).clip(lower=0)
+    pred[upper_col] = (pred[pred_col] * (1 + pred['_pi_q'])).clip(lower=0)
+
+    pred = pred.drop(columns=['_pi_q'])
+    return pred

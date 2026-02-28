@@ -158,6 +158,13 @@ Business interpretation:
 - Lag-aware nowcasting delivers slightly stronger stress-test performance while keeping bounded, interpretable behavior.
 - Recommendation is to use lag-aware in production outputs and keep EPSR as a governance fallback.
 
+### Methodology justification: pros and cons of explored rules
+- **Group Average**: strong sanity baseline, but no temporal adaptation.
+- **Naive Lag-1**: captures short memory, but unstable under missing/noisy prior periods.
+- **EPSR**: excellent interpretability and governance benchmark, but less reactive to local month-level shifts.
+- **XGBoost / LightGBM / KNN**: flexible learning capacity, but weaker stability and higher governance complexity for this dataset.
+- **Lag-Aware Hierarchical Nowcast**: best balance of accuracy, stress stability, and bounded behavior; selected for final use.
+
 ---
 
 ## 5) How to Proceed to Lag-Aware Hierarchical Nowcasting (Next Phase)
@@ -207,6 +214,7 @@ The notebook now builds a full imputed dataframe with explicit labels and saves 
 - `total_streams`
 - `total_gross_amount` (original reported value)
 - `filled_revenue` (single final revenue field)
+- `nowcast_lower_90`, `nowcast_upper_90` (uncertainty bounds for nowcasted rows)
 - `value_status`: `actual` vs `nowcasted`
 - `nowcast_reason`: `missing_or_zero_revenue` or `quality_flag_low_revenue_high_streams` or `reported_actual`
 - `quality_flag_low_revenue_high_streams` (binary)
@@ -232,6 +240,17 @@ Current nowcast composition after strict rule:
 - total nowcasted rows: `322`
 - missing/zero nowcasted rows: `286`
 - quality-flag nowcasted rows: `36`
+
+### Prediction interval construction and interpretation
+Intervals are created from calibration residuals on clean known rows:
+1. compute relative absolute error,
+2. estimate 90th percentile error (group-level with global fallback),
+3. apply symmetric bounds around each nowcast.
+
+Interpretation for stakeholders:
+- bounds indicate uncertainty range around each estimated value,
+- wider ranges imply higher uncertainty,
+- bounds are only populated for nowcasted rows.
 
 ---
 

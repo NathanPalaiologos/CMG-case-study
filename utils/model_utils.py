@@ -26,6 +26,78 @@ def _non_negative(pred):
     return np.clip(pred, a_min=0, a_max=None)
 
 
+def _apply_dsp_rps_guardrail(
+    train_data: pd.DataFrame,
+    scored: pd.DataFrame,
+    pred_col: str,
+    stream_col: str,
+    target_col: str,
+):
+    """
+    Cap predicted RPS to a robust DSP-specific upper bound learned from training data.
+
+    Bound logic is intentionally simple and explainable:
+    - compute DSP median and p95 historical RPS on clean training rows
+    - cap each prediction at max(3 * median, 1.25 * p95)
+    - fallback to global statistics when DSP history is sparse
+    """
+    out = scored.copy()
+
+    train = train_data.copy()
+    valid_train = (
+        train[stream_col].notna()
+        & (train[stream_col] > 0)
+        & train[target_col].notna()
+        & (train[target_col] >= 0)
+    )
+    train = train.loc[valid_train].copy()
+
+    if train.empty:
+        out['guardrail_applied'] = False
+        return out
+
+    train['train_rps'] = train[target_col] / (train[stream_col] / 1_000_000)
+    train = train.replace([np.inf, -np.inf], np.nan)
+    train = train[train['train_rps'].notna()].copy()
+
+    if train.empty:
+        out['guardrail_applied'] = False
+        return out
+
+    dsp_stats = (
+        train.groupby('dsp')['train_rps']
+        .agg(rps_median='median', rps_p95=lambda s: s.quantile(0.95))
+        .reset_index()
+    )
+    global_median = float(train['train_rps'].median())
+    global_p95 = float(train['train_rps'].quantile(0.95))
+
+    out = out.merge(dsp_stats, on='dsp', how='left')
+    out['rps_median'] = out['rps_median'].fillna(global_median)
+    out['rps_p95'] = out['rps_p95'].fillna(global_p95)
+    out['rps_cap'] = np.maximum(3.0 * out['rps_median'], 1.25 * out['rps_p95'])
+
+    safe_streams = out[stream_col].fillna(0).clip(lower=0)
+    pred = out[pred_col].fillna(0).clip(lower=0)
+    pred_rps = pd.Series(
+        np.where(safe_streams > 0, pred / (safe_streams / 1_000_000), np.nan),
+        index=out.index,
+    )
+
+    capped_pred = np.where(
+        safe_streams > 0,
+        np.minimum(pred, out['rps_cap'] * (safe_streams / 1_000_000)),
+        0.0,
+    )
+
+    out['guardrail_applied'] = (pred_rps > out['rps_cap']).fillna(False)
+    out[pred_col] = _non_negative(capped_pred)
+
+    drop_cols = ['rps_median', 'rps_p95', 'rps_cap']
+    out = out.drop(columns=[c for c in drop_cols if c in out.columns])
+    return out
+
+
 def _build_feature_matrices(
     train_data: pd.DataFrame,
     score_data: pd.DataFrame,
@@ -200,4 +272,13 @@ def fit_predict_lag_hier_nowcast(
 
     reconciled = _non_negative(scored['blended_pred'] * scored['scale'])
     reconciled = np.nan_to_num(reconciled, nan=0.0, posinf=0.0, neginf=0.0)
-    return reconciled
+
+    scored['nowcast_pred_raw'] = reconciled
+    scored = _apply_dsp_rps_guardrail(
+        train_data=train_data,
+        scored=scored,
+        pred_col='nowcast_pred_raw',
+        stream_col=stream_col,
+        target_col=target_col,
+    )
+    return scored['nowcast_pred_raw'].values
