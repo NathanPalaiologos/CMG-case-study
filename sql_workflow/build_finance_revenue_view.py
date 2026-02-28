@@ -373,8 +373,8 @@ def main() -> None:
     # Run modeling + audit pipeline.
     final_df, suspicious_df, dsp_month_audit_df, summary = run_nowcast_and_audit(merged_df)
 
-    final_csv = data_dir / "imputed_revenue_lag-aware_hierarchical_nowcast.csv"
-    final_xlsx = data_dir / "imputed_revenue_lag-aware_hierarchical_nowcast.xlsx"
+    final_csv = data_dir / "Nathan_Zhang_CMG_Revenue_Forecast_Oct2025.csv"
+    final_xlsx = data_dir / "Nathan_Zhang_CMG_Revenue_Forecast_Oct2025.xlsx"
     suspicious_csv = data_dir / "output_audit_suspicious_rows.csv"
     dsp_month_audit_csv = data_dir / "output_audit_dsp_month_reliability.csv"
     run_summary_json = data_dir / "pipeline_run_summary.json"
