@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -135,6 +136,76 @@ def _build_feature_matrices(
     y_train_log = np.log1p(y_train)
 
     return X_train, X_score, y_train, y_train_log
+
+
+def _build_linear_feature_matrices(
+    train_data: pd.DataFrame,
+    score_data: pd.DataFrame,
+    categorical_cols,
+    target_col: str,
+    stream_col: str,
+):
+    """Build aligned matrices for linear-family models with lag median imputation."""
+    train_feat = add_time_columns(train_data).copy()
+    score_feat = add_time_columns(score_data).copy()
+
+    feature_cols = categorical_cols + [
+        'month_num', 'quarter', stream_col,
+        'gross_lag_1', 'streams_lag_1', 'epsr_lag_1'
+    ]
+    lag_cols = ['gross_lag_1', 'streams_lag_1', 'epsr_lag_1']
+
+    lag_fill = {col: train_feat[col].median() for col in lag_cols}
+    train_feat[lag_cols] = train_feat[lag_cols].fillna(lag_fill)
+    score_feat[lag_cols] = score_feat[lag_cols].fillna(lag_fill)
+
+    x_train = pd.get_dummies(train_feat[feature_cols], columns=categorical_cols, dummy_na=True, drop_first=True)
+    x_score = pd.get_dummies(score_feat[feature_cols], columns=categorical_cols, dummy_na=True, drop_first=True)
+    x_score = x_score.reindex(columns=x_train.columns, fill_value=0)
+
+    y_train = train_feat[target_col].values
+    return x_train, x_score, y_train
+
+
+def fit_predict_linear_refined(
+    train_data: pd.DataFrame,
+    score_data: pd.DataFrame,
+    categorical_cols,
+    target_col: str,
+    stream_col: str,
+):
+    """Train LinearRegression with lag features and return non-negative predictions."""
+    x_train, x_score, y_train = _build_linear_feature_matrices(
+        train_data=train_data,
+        score_data=score_data,
+        categorical_cols=categorical_cols,
+        target_col=target_col,
+        stream_col=stream_col,
+    )
+    model = LinearRegression()
+    model.fit(x_train, y_train)
+    return _non_negative(model.predict(x_score))
+
+
+def fit_predict_ridge_refined(
+    train_data: pd.DataFrame,
+    score_data: pd.DataFrame,
+    categorical_cols,
+    target_col: str,
+    stream_col: str,
+    alpha: float = 10.0,
+):
+    """Train Ridge regression with lag features and return non-negative predictions."""
+    x_train, x_score, y_train = _build_linear_feature_matrices(
+        train_data=train_data,
+        score_data=score_data,
+        categorical_cols=categorical_cols,
+        target_col=target_col,
+        stream_col=stream_col,
+    )
+    model = Ridge(alpha=alpha, random_state=42, solver='svd')
+    model.fit(x_train, y_train)
+    return _non_negative(model.predict(x_score))
 
 
 def fit_predict_xgb_refined(

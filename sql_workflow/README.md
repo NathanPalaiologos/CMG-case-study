@@ -7,11 +7,18 @@ This folder contains the production-style workflow that turns harmonized source 
 - `build_finance_revenue_view.py`
 
 ## What It Does
-1. Harmonizes Revenue + Streams with SQL (DuckDB CTE pipeline)
+1. Harmonizes Revenue and Streams with SQL (DuckDB CTE pipeline)
 2. Applies missing/zero and cohort-aware quality flags
 3. Runs lag-aware hierarchical nowcast for targeted rows
 4. Runs final output audit checks
-5. Exports CSV/XLSX and run summary JSON
+5. Exports `.csv` / `.xlsx` and run summary `.json`
+
+Quality-flag rule:
+- Fixed-effects residual flagging on log-RPS (`territory_name` + `dsp`)
+- `fe_threshold_quantile = 0.05`, `min_group_rows = 24`, `low_revenue_threshold = None`
+
+DSP-month reliability flagging:
+- `risk_flag = caution` when `nowcast_rate >= 0.80` or `uncertainty_width_pct >= 35`
 
 ## Prerequisites
 - Run from the **project root**: `CMG Case Study/`
@@ -41,11 +48,6 @@ python sql_workflow/build_finance_revenue_view.py --refresh-merged --input-xlsx 
 ```bash
 python sql_workflow/build_finance_revenue_view.py --refresh-merged --revenue-csv data/revenue.csv --streams-csv data/streams.csv
 ```
-
-## Why SQL for Cleaning
-- Uses SQL CTEs mirroring `sql_pipeline/01_data_harmonization.sql`.
-- Easier to audit transformation rules.
-- DuckDB executes vectorized SQL efficiently for larger tabular datasets.
 
 ## Outputs
 - `data/merged_data.csv` (when `--refresh-merged` is used)

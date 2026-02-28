@@ -43,6 +43,10 @@ Use distribution-aware masking backtest (30 repeats):
 3. Train on remaining known rows.
 4. Evaluate MAE/WMAPE distribution (mean, std, p10, p50, p90).
 
+Guardrails for validity:
+- Run stress test only when target-month distribution overlaps with known-row months.
+- Use `mean` and `p90` jointly for model choice to control tail risk.
+
 ### How the distribution-aware test works (non-technical)
 Think of this as a "fire drill" that mimics where missing values really happen.
 
@@ -114,6 +118,10 @@ Implemented under the same evaluation protocol:
 - XGBoost (refined)
 - LightGBM (refined)
 - KNN (refined)
+- LinearRegression
+- Ridge(alpha=10)
+
+Notebook 02 keeps these under one consolidated **Model-Based Methods** section for direct, side-by-side comparison.
 
 Refinements to reduce overfitting and instability:
 - Lightweight lag-aware features (`gross_lag_1`, `streams_lag_1`, `epsr_lag_1`)
@@ -231,15 +239,19 @@ RPS is set to `NaN` when streams are zero/non-positive.
 Rows are auto-flagged and nowcasted when all conditions hold:
 1. `is_na == 0`
 2. `is_zero == 0`
-3. `0 < total_gross_amount <= 99` (single/two-digit revenue)
-4. Revenue-per-stream is abnormally low **vs local cohort baseline** (`territory + dsp`, with `dsp/global` fallback)
+3. Compute log-RPS and de-mean by additive fixed effects (`territory_name` + `dsp`).
+4. Learn one global lower-tail threshold from known-row residuals.
+5. Flag rows with residuals below that learned threshold (optional absolute revenue cap can be applied).
+
+Active setting in notebook/workflow:
+- `fe_threshold_quantile = 0.03`
+- `min_group_rows = 24`
+- `low_revenue_threshold = None`
 
 This avoids flagging based on stream magnitude alone and is better aligned with regional pricing differences.
 
 Current nowcast composition after strict rule:
-- total nowcasted rows: `322`
-- missing/zero nowcasted rows: `286`
-- quality-flag nowcasted rows: `36`
+- Final counts are read from `data/pipeline_run_summary.json` for each run.
 
 ### Prediction interval construction and interpretation
 Intervals are created from calibration residuals on clean known rows:

@@ -17,13 +17,23 @@ def add_quality_flags(
     data: pd.DataFrame,
     stream_col: Optional[str] = None,
     target_col: Optional[str] = None,
-    low_ratio_threshold: float = 0.20,
-    low_revenue_threshold: float = 99
+    low_revenue_threshold: Optional[float] = None,
+    min_group_rows: int = 24,
+    fe_threshold_quantile: float = 0.05,
 ) -> pd.DataFrame:
     """
-    Add a quality flag for rows that have low revenue but high streams, 
-    which may indicate potential data issues or edge cases that require 
-    special handling in the modeling process.
+        Add a fixed-effects quality flag for suspiciously low EPSR rows.
+
+    Rule design:
+        - Compute row log-RPS = log(revenue / streams).
+        - De-mean with additive fixed effects: territory + DSP.
+        - Learn one global residual threshold from known rows.
+        - Flag rows with residual below this threshold.
+
+    Parameters:
+    - low_revenue_threshold: optional absolute revenue cap; set None to disable.
+    - min_group_rows: minimum rows required to trust territory or DSP effects.
+    - fe_threshold_quantile: lower-tail quantile used to learn the global residual threshold.
     """
     out = data.copy()
     out['_orig_index'] = out.index
@@ -44,41 +54,59 @@ def add_quality_flags(
     out.loc[known_mask, 'epsr_row'] = out.loc[known_mask, target_col] / out.loc[known_mask, stream_col]
 
     known = out.loc[known_mask].copy()
-    cohort_stats = (
-        known.groupby(['territory_name', 'dsp'])['epsr_row']
-        .agg(cohort_epsr_median='median', cohort_epsr_p10=lambda s: s.quantile(0.10), cohort_n='size')
+    known['log_rps_row'] = np.log(known['epsr_row'].clip(lower=1e-12))
+
+    global_mean = known['log_rps_row'].mean()
+
+    territory_stats = (
+        known.groupby('territory_name')['log_rps_row']
+        .agg(t_mean='mean', t_n='size')
         .reset_index()
     )
     dsp_stats = (
-        known.groupby(['dsp'])['epsr_row']
-        .agg(dsp_epsr_median='median', dsp_epsr_p10=lambda s: s.quantile(0.10), dsp_n='size')
+        known.groupby('dsp')['log_rps_row']
+        .agg(d_mean='mean', d_n='size')
         .reset_index()
     )
-    global_median = known['epsr_row'].median()
-    global_p10 = known['epsr_row'].quantile(0.10)
 
-    out = out.merge(cohort_stats, on=['territory_name', 'dsp'], how='left')
-    out = out.merge(dsp_stats, on=['dsp'], how='left')
+    out['log_rps_row'] = np.log(out['epsr_row'].clip(lower=1e-12))
+    out = out.merge(territory_stats, on='territory_name', how='left')
+    out = out.merge(dsp_stats, on='dsp', how='left')
 
-    out['epsr_ref_median'] = out['cohort_epsr_median'].fillna(out['dsp_epsr_median']).fillna(global_median)
-    out['epsr_ref_p10'] = out['cohort_epsr_p10'].fillna(out['dsp_epsr_p10']).fillna(global_p10)
-    out['epsr_ratio_vs_local'] = out['epsr_row'] / out['epsr_ref_median'].replace(0, np.nan)
-
-    local_low_signal = (
-        out['epsr_ratio_vs_local'] <= low_ratio_threshold
-    ) | (
-        out['epsr_row'] <= (0.5 * out['epsr_ref_p10'])
+    out['territory_effect'] = np.where(
+        out['t_n'].fillna(0) >= min_group_rows,
+        out['t_mean'] - global_mean,
+        0.0,
     )
+    out['dsp_effect'] = np.where(
+        out['d_n'].fillna(0) >= min_group_rows,
+        out['d_mean'] - global_mean,
+        0.0,
+    )
+    out['log_rps_fe_hat'] = global_mean + out['territory_effect'] + out['dsp_effect']
+    out['log_rps_fe_resid'] = out['log_rps_row'] - out['log_rps_fe_hat']
+
+    known_resid = out.loc[known_mask, 'log_rps_fe_resid']
+    fe_low_threshold = known_resid.quantile(fe_threshold_quantile)
+    if pd.isna(fe_low_threshold):
+        fe_low_threshold = -1.0
+
+    local_low_signal = out['log_rps_fe_resid'] <= fe_low_threshold
+
+    if low_revenue_threshold is not None:
+        local_low_signal = local_low_signal & (out[target_col] <= low_revenue_threshold)
 
     out['quality_flag_low_revenue_high_streams'] = (
         known_mask
-        & (out[target_col] <= low_revenue_threshold)
         & local_low_signal.fillna(False)
     ).astype(int)
 
     drop_cols = [
-        'epsr_row', 'cohort_epsr_median', 'cohort_epsr_p10', 'cohort_n',
-        'dsp_epsr_median', 'dsp_epsr_p10', 'dsp_n', 'epsr_ref_median', 'epsr_ref_p10', 'epsr_ratio_vs_local'
+        'epsr_row',
+        'log_rps_row',
+        't_mean', 't_n', 'd_mean', 'd_n',
+        'territory_effect', 'dsp_effect',
+        'log_rps_fe_hat', 'log_rps_fe_resid',
     ]
     out = out.drop(columns=[c for c in drop_cols if c in out.columns])
 
@@ -248,6 +276,8 @@ def run_distribution_backtest(
 
     month_dist = target_pool['month'].value_counts(normalize=True).sort_index()
     month_dist = month_dist[month_dist.index.isin(set(known_pool['month'].unique()))]
+    if month_dist.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
     # Normalize month
     month_dist = month_dist / month_dist.sum()
@@ -332,7 +362,7 @@ def build_relative_prediction_intervals(
     Build two-sided prediction intervals using absolute relative errors from a calibration set.
 
     Method:
-    1) Compute calibration relative error: |actual - pred| / max(|pred|, 1e-6)
+    1) Compute calibration relative error: |actual - pred| / max(|pred|, 1e-6), avoid divide by 0
     2) Take quantile q at (1 - alpha)
     3) Interval for each prediction is pred * (1 +/- q), clipped at zero on lower bound
 

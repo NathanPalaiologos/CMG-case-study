@@ -28,8 +28,9 @@ This vocabulary is used consistently across workflow outputs and documentation.
 1. Revenue values are non-negative.
 2. Streams are the primary complete signal.
 3. Rows with `is_na=1` or `is_zero=1` are direct estimation targets.
-4. Strict quality-correction targets are locally abnormal low-revenue rows.
+4. Strict quality-correction targets are locally abnormal low-EPSR rows.
 5. Missingness is not random across months, so random split alone is insufficient for selection.
+6. Quality flagging is designed for targeted correction, not broad outlier deletion.
 
 ### Assumption rationale
 - Late-month statement lag creates concentrated missingness.
@@ -39,13 +40,21 @@ This vocabulary is used consistently across workflow outputs and documentation.
 ---
 
 ## Pipeline Logic (Standardized)
+Notebook 02 execution order is kept minimal and reproducible:
+- Baselines and initial flag profile
+- **Flagging Report (Current Rule)** near the beginning
+- Model-based section including tree, KNN, and linear-family methods
+- EPSR and Lag-Aware sections, then stress test and final deliverable
+
 1. **SQL harmonization**
    - Standardize DSP labels.
    - Align stream geography to revenue territory logic.
    - Merge to one row grain with `is_na` / `is_zero` indicators.
 
 2. **Quality targeting**
-   - Flag strict local low-EPSR rows (`quality_flag_low_revenue_high_streams`).
+   - Flag strict local low-EPSR rows (`quality_flag_low_revenue_high_streams`) using fixed-effects de-mean residuals.
+   - Fixed effects use `territory_name` and `dsp`; a single learned global residual threshold is applied after de-meaning.
+   - Active parameters in notebook/workflow: `fe_threshold_quantile = 0.03`, `min_group_rows = 24`, `low_revenue_threshold = None`.
 
 3. **Feature preparation**
    - Add time features and lag features (`gross_lag_1`, `streams_lag_1`, `epsr_lag_1`).
@@ -87,6 +96,8 @@ Design intent:
 - XGBoost refined
 - LightGBM refined
 - KNN refined
+- LinearRegression
+- Ridge(alpha=10)
 - Lag-Aware Hierarchical Nowcast
 
 ### Rule-by-rule pros and cons
@@ -134,6 +145,10 @@ EPSR is retained as benchmark/fallback.
 ### Why this process
 It reflects production-like missingness better than IID random splits and gives a decision basis that includes both expected performance and downside behavior.
 
+Validation assumptions:
+- Holdout month mix must overlap with known months; otherwise stress-test output is treated as unavailable.
+- Selection is based on both central tendency (`mean`) and tail risk (`p90`), not only one metric.
+
 ---
 
 ## Prediction Interval Method (Reusable Utility)
@@ -164,11 +179,8 @@ Interpretation:
 ---
 
 ## Row Accounting (Current Verified Run)
-- Harmonized rows: `2000`
-- Missing/zero target rows: `286`
-- Strict quality-correction rows: `36`
-- Final estimated rows: `322` (`286 + 36`)
-- Final actual rows: `1678`
+- Row accounting is produced per run in `data/pipeline_run_summary.json`.
+- Core monitored fields: `rows_total`, `rows_nowcasted`, `rows_nowcasted_missing_or_zero`, `rows_nowcasted_quality_flag`, `rows_actual`.
 
 Interpretation: estimation is targeted, not blanket replacement.
 
@@ -190,11 +202,7 @@ Required output fields:
 ---
 
 ## Current Validation Snapshot
-- `rows_total = 2000`
-- `rows_nowcasted = 322`
-- `rows_nowcasted_missing_or_zero = 286`
-- `rows_nowcasted_quality_flag = 36`
-- `hard_invalid_rows = 0`
-- `severe_suspicious_rows = 0`
+- Validation snapshot is tracked in `data/pipeline_run_summary.json` and `data/output_audit_dsp_month_reliability.csv`.
+- Zero hard-invalid rows and low caution concentration are required before handoff.
 
 Status: stable and handoff-ready.

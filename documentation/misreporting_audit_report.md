@@ -39,8 +39,8 @@ Interpretation: any model trained/evaluated without explicitly handling this ske
 Interpretation: these patterns can be valid for some contracts, but they are strong candidates for misreporting or processing artifacts and should be quarantined from model training unless verified.
 
 Update after stricter rule rollout:
-- Flag logic was tightened to include single/two-digit revenues (`<= 99`) using local cohort comparison.
-- Total quality-flag rows under current cohort-aware rule: `36`.
+- Flag logic uses territory-aware dynamic EPSR thresholds (with hierarchical fallback for sparse cohorts).
+- Total quality-flag rows under current cohort-aware rule: `48`.
 
 ---
 
@@ -73,8 +73,8 @@ Use a two-table pattern:
 For known rows (`is_na=0`, `is_zero=0`, streams>0), create flags:
 
 1. **Rule A: strict low revenue vs local cohort (implemented)**
-   - `0 < total_gross_amount <= 99` and local EPSR ratio is abnormally low vs `territory + dsp` baseline
-   - fallback hierarchy: `territory + dsp` -> `dsp` -> global
+   - Use fixed-effects de-mean residuals on log-RPS (`territory_name` + `dsp`)
+   - Apply one learned global lower-tail threshold to flag under-reported rows
 2. **Rule B: robust cross-sectional RPS outlier**
    - Compute `log1p(rps)` and robust z-score by DSP (or BU+DSP when enough data)
    - Flag when `|robust_z| > 4.5`
@@ -96,7 +96,7 @@ Recommended action by severity:
 Implemented behavior in notebook:
 - Rows flagged by Rule A are nowcasted with the same final lag-aware model.
 - Final output now records `nowcast_reason` and `quality_flag_low_revenue_high_streams`.
-- Current composition: 322 nowcasted rows = 286 missing/zero + 36 strict quality-flag rows.
+- Current composition: 334 nowcasted rows = 286 missing/zero + 48 strict quality-flag rows.
 
 ---
 

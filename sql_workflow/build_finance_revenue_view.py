@@ -22,8 +22,8 @@ from utils.model_utils import fit_predict_lag_hier_nowcast
 TARGET_COL = "total_gross_amount"
 STREAM_COL = "total_streams"
 GROUP_COLS = ["business_unit", "territory_name", "dsp"]
-LOW_REVENUE_THRESHOLD = 99.0
-LOW_RATIO_THRESHOLD = 0.20
+MIN_FLAG_GROUP_ROWS = 24
+FE_THRESHOLD_QUANTILE = 0.03
 
 
 def harmonize_with_sql(
@@ -40,7 +40,7 @@ def harmonize_with_sql(
     """
     con = duckdb.connect(database=":memory:")
 
-    # Input mode A: large-data friendly CSV path (SQL reads files directly).
+    # Input mode A: large-data friendly CSV path.
     if revenue_csv and streams_csv:
         con.execute(
             """
@@ -64,8 +64,7 @@ def harmonize_with_sql(
         con.register("streams", streams_df)
     else:
         raise ValueError("Provide either --input-xlsx or both --revenue-csv and --streams-csv")
-
-    # This SQL is intentionally verbose so reviewers can audit every transformation step.
+    
     # Flow: standardize labels -> aggregate -> align territories -> full join -> add flags.
     query = """
     WITH revenue_standardized AS (
@@ -165,8 +164,9 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         merged_df,
         stream_col=STREAM_COL,
         target_col=TARGET_COL,
-        low_ratio_threshold=LOW_RATIO_THRESHOLD,
-        low_revenue_threshold=LOW_REVENUE_THRESHOLD,
+        low_revenue_threshold=None,
+        min_group_rows=MIN_FLAG_GROUP_ROWS,
+        fe_threshold_quantile=FE_THRESHOLD_QUANTILE,
     )
 
     # Step 2) Define rows that should be estimated.
@@ -188,8 +188,9 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         lag_df,
         stream_col=STREAM_COL,
         target_col=TARGET_COL,
-        low_ratio_threshold=LOW_RATIO_THRESHOLD,
-        low_revenue_threshold=LOW_REVENUE_THRESHOLD,
+        low_revenue_threshold=None,
+        min_group_rows=MIN_FLAG_GROUP_ROWS,
+        fe_threshold_quantile=FE_THRESHOLD_QUANTILE,
     )
 
     # Step 4) Train only on cleaner known rows.
@@ -237,7 +238,6 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     )
 
     # Step 6) Build final revenue field and transparent status labels.
-    # `filled_revenue` is the single value downstream users should consume.
     final_df = work_df.copy()
     final_df["filled_revenue"] = final_df[TARGET_COL]
     final_df.loc[score_df.index, "filled_revenue"] = score_df["nowcast_pred"].values
