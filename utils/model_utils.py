@@ -12,6 +12,7 @@ from utils.forecast_utils import add_time_columns, fit_epsr_lookup, apply_epsr_l
 
 def split_time_holdout(eval_df: pd.DataFrame):
     """Use the latest available month as validation for a simple time-aware split."""
+    # This keeps validation close to real forecasting conditions.
     eval_months = sorted(eval_df['month'].unique())
     if len(eval_months) < 2:
         return train_test_split(eval_df, test_size=0.2, random_state=42)
@@ -42,6 +43,7 @@ def _apply_dsp_rps_guardrail(
     - cap each prediction at max(3 * median, 1.25 * p95)
     - fallback to global statistics when DSP history is sparse
     """
+    # Guardrail is intentionally simple: cap impossible monetization spikes, do not reshape whole distributions.
     out = scored.copy()
 
     train = train_data.copy()
@@ -57,6 +59,7 @@ def _apply_dsp_rps_guardrail(
         out['guardrail_applied'] = False
         return out
 
+    # Convert to business-readable RPS units (revenue per 1M streams).
     train['train_rps'] = train[target_col] / (train[stream_col] / 1_000_000)
     train = train.replace([np.inf, -np.inf], np.nan)
     train = train[train['train_rps'].notna()].copy()
@@ -76,6 +79,7 @@ def _apply_dsp_rps_guardrail(
     out = out.merge(dsp_stats, on='dsp', how='left')
     out['rps_median'] = out['rps_median'].fillna(global_median)
     out['rps_p95'] = out['rps_p95'].fillna(global_p95)
+    # Cap is generous enough for growth while still protecting against implausible jumps.
     out['rps_cap'] = np.maximum(3.0 * out['rps_median'], 1.25 * out['rps_p95'])
 
     safe_streams = out[stream_col].fillna(0).clip(lower=0)
@@ -119,6 +123,7 @@ def _build_feature_matrices(
     ]
 
     lag_cols = ['gross_lag_1', 'streams_lag_1', 'epsr_lag_1']
+    # Median lag imputation avoids dropping rows while staying robust to extreme values.
     lag_fill = {col: train_feat[col].median() for col in lag_cols}
 
     train_feat[lag_cols] = train_feat[lag_cols].fillna(lag_fill)
@@ -128,6 +133,7 @@ def _build_feature_matrices(
     X_score = pd.get_dummies(score_feat[feature_cols], columns=categorical_cols, dummy_na=True)
     X_score = X_score.reindex(columns=X_train.columns, fill_value=0)
 
+    # Normalize column names to avoid model-library edge cases with spaces.
     clean_cols = [col.replace(' ', '_') for col in X_train.columns]
     X_train.columns = clean_cols
     X_score.columns = clean_cols
@@ -217,6 +223,7 @@ def fit_predict_xgb_refined(
     """Train an XGBoost regressor on log-revenue and return non-negative predictions."""
     X_train, X_score, _, y_train_log = _build_feature_matrices(train_data, score_data, categorical_cols, stream_col)
 
+    # Conservative settings are chosen for stability over leaderboard chasing.
     model = XGBRegressor(
         n_estimators=350,
         learning_rate=0.04,
@@ -244,6 +251,7 @@ def fit_predict_lgbm_refined(
     """Train a LightGBM regressor on log-revenue and return non-negative predictions."""
     X_train, X_score, _, y_train_log = _build_feature_matrices(train_data, score_data, categorical_cols, stream_col)
 
+    # LightGBM mirrors the same low-variance tuning philosophy as XGBoost here.
     model = LGBMRegressor(
         n_estimators=350,
         learning_rate=0.04,
@@ -269,6 +277,7 @@ def fit_predict_knn_refined(
     """Train a scaled KNN regressor and return non-negative predictions."""
     X_train, X_score, y_train, _ = _build_feature_matrices(train_data, score_data, categorical_cols, stream_col)
 
+    # KNN needs standardized scales so distance is meaningful across mixed features.
     scaler = StandardScaler(with_mean=True, with_std=True)
     X_train_scaled = scaler.fit_transform(X_train.values)
     X_score_scaled = scaler.transform(X_score.values)
@@ -293,11 +302,13 @@ def fit_predict_lag_hier_nowcast(
     target_col: str,
 ):
     """Lag-aware nowcast: EPSR anchor + bounded lag trend adjustment + simple reconciliation."""
+    # Reset index to keep all intermediate merges/aggregations deterministic.
     scored = score_data.copy().reset_index(drop=True)
     train_epsr = fit_epsr_lookup(train_data, group_cols, target_col, stream_col)
     epsr_anchor = apply_epsr_lookup(scored, train_epsr, group_cols, stream_col, target_col)
 
     safe_streams = scored[stream_col].fillna(0).clip(lower=0)
+    # Global EPSR fallback only activates when a row cannot be mapped by hierarchy.
     global_epsr = np.divide(
         train_data[target_col].sum(),
         max(train_data[stream_col].sum(), 1),
@@ -318,7 +329,7 @@ def fit_predict_lag_hier_nowcast(
     scored['anchor_pred'] = anchor_pred
     scored['lag_proj'] = lag_proj
 
-    # Anchor-first blend for stability.
+    # Anchor-first blend for stability: lag information nudges but does not dominate.
     has_lag = scored['lag_proj'].notna()
     lag_weight = pd.Series(np.where(has_lag, 0.20, 0.00), index=scored.index)
     lag_value = scored['lag_proj'].fillna(scored['anchor_pred'])
@@ -329,7 +340,7 @@ def fit_predict_lag_hier_nowcast(
     adjust_ratio = adjust_ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=0.85, upper=1.15)
     scored['blended_pred'] = scored['anchor_pred'] * adjust_ratio
 
-    # Reconcile at (month, dsp) so totals remain close to anchor totals.
+    # Reconcile at (month, dsp) so micro adjustments do not drift aggregate totals.
     grouped = scored.groupby(['month', 'dsp'], as_index=False).agg(
         raw_sum=('blended_pred', 'sum'),
         anchor_sum=('anchor_pred', 'sum')
@@ -344,6 +355,7 @@ def fit_predict_lag_hier_nowcast(
     reconciled = _non_negative(scored['blended_pred'] * scored['scale'])
     reconciled = np.nan_to_num(reconciled, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Final safety gate: cap extreme implied RPS before returning production predictions.
     scored['nowcast_pred_raw'] = reconciled
     scored = _apply_dsp_rps_guardrail(
         train_data=train_data,

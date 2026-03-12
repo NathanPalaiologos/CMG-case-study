@@ -15,7 +15,7 @@ This folder contains the production-style workflow that turns harmonized source 
 
 Quality-flag rule:
 - Fixed-effects residual flagging on log-RPS (`territory_name` + `dsp`)
-- `fe_threshold_quantile = 0.05`, `min_group_rows = 24`, `low_revenue_threshold = None`
+- `fe_threshold_quantile = 0.03`, `min_group_rows = 24`, `low_revenue_threshold = None`
 
 DSP-month reliability flagging:
 - `risk_flag = caution` when `nowcast_rate >= 0.80` or `uncertainty_width_pct >= 35`

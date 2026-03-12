@@ -19,7 +19,7 @@ def add_quality_flags(
     target_col: Optional[str] = None,
     low_revenue_threshold: Optional[float] = None,
     min_group_rows: int = 24,
-    fe_threshold_quantile: float = 0.05,
+    fe_threshold_quantile: float = 0.03,
 ) -> pd.DataFrame:
     """
         Add a fixed-effects quality flag for suspiciously low EPSR rows.
@@ -35,6 +35,7 @@ def add_quality_flags(
     - min_group_rows: minimum rows required to trust territory or DSP effects.
     - fe_threshold_quantile: lower-tail quantile used to learn the global residual threshold.
     """
+    # Keep index around so merge steps do not silently break row alignment.
     out = data.copy()
     out['_orig_index'] = out.index
     out['quality_flag_low_revenue_high_streams'] = 0
@@ -51,11 +52,13 @@ def add_quality_flags(
         out.index.name = data.index.name
         return out
 
+    # EPSR at row level is the signal we audit for suspiciously low monetization.
     out.loc[known_mask, 'epsr_row'] = out.loc[known_mask, target_col] / out.loc[known_mask, stream_col]
 
     known = out.loc[known_mask].copy()
     known['log_rps_row'] = np.log(known['epsr_row'].clip(lower=1e-12))
 
+    # Global center acts as a neutral baseline before adding territory/DSP effects.
     global_mean = known['log_rps_row'].mean()
 
     territory_stats = (
@@ -86,11 +89,13 @@ def add_quality_flags(
     out['log_rps_fe_hat'] = global_mean + out['territory_effect'] + out['dsp_effect']
     out['log_rps_fe_resid'] = out['log_rps_row'] - out['log_rps_fe_hat']
 
+    # Learn one lower-tail cutoff from known rows so the flag is stable and easy to explain.
     known_resid = out.loc[known_mask, 'log_rps_fe_resid']
     fe_low_threshold = known_resid.quantile(fe_threshold_quantile)
     if pd.isna(fe_low_threshold):
         fe_low_threshold = -1.0
 
+    # A row is suspicious when it sits unusually low versus its expected local RPS level.
     local_low_signal = out['log_rps_fe_resid'] <= fe_low_threshold
 
     if low_revenue_threshold is not None:
@@ -165,6 +170,7 @@ def prepare_eval_frames(
     if excluded_months is None:
         excluded_months = []
 
+    # `known_all` is for fitting lookups; `known_eval` is for fair evaluation windows.
     work = add_time_columns(data)
     known_mask = (work['is_na'] == 0) & (work['is_zero'] == 0) & (work[stream_col] > 0)
     include_mask = ~work['month_str'].isin(excluded_months)
@@ -201,6 +207,7 @@ def apply_group_average_lookup(score_data: pd.DataFrame, lookup, group_cols):
 
 def fit_epsr_lookup(train_known: pd.DataFrame, group_cols, target_col: str, stream_col: str):
     """Fit EPSR fallback tables from most-granular to global level."""
+    # Hierarchical fallback keeps predictions available even for sparse cohorts.
     cohort = (
         train_known.groupby(group_cols).apply(
             lambda x: x[target_col].sum() / x[stream_col].sum()
@@ -282,6 +289,7 @@ def run_distribution_backtest(
     # Normalize month
     month_dist = month_dist / month_dist.sum()
 
+    # Match synthetic holdout size to the production missingness share.
     holdout_ratio = len(target_pool) / (len(known_pool) + len(target_pool))
     holdout_size = max(1, int(len(known_pool) * holdout_ratio))
 
@@ -297,6 +305,7 @@ def run_distribution_backtest(
             for idx in rng.choice(len(per_month_counts), size=remainder, replace=True, p=month_dist.values):
                 per_month_counts[idx] += 1
 
+        # Sample each month independently so test composition mirrors production pressure.
         sampled_idx = []
         for month_value, n_rows in zip(month_dist.index, per_month_counts):
             candidates = known_pool[known_pool['month'] == month_value]
@@ -381,6 +390,7 @@ def build_relative_prediction_intervals(
     safe_pred = cal[calibration_pred_col].abs().clip(lower=1e-6)
     cal['_rel_err'] = (cal[actual_col] - cal[calibration_pred_col]).abs() / safe_pred
 
+    # Global fallback keeps interval generation robust for thin groups.
     global_q = cal['_rel_err'].quantile(1 - alpha)
     if pd.isna(global_q):
         global_q = 0.25

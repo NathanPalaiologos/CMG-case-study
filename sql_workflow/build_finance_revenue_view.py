@@ -38,6 +38,7 @@ def harmonize_with_sql(
     - keeps transformation logic auditable and close to the provided SQL script
     - scales better than row-wise Python for large tabular processing
     """
+    # In-memory DuckDB keeps the run lightweight while still giving full SQL traceability.
     con = duckdb.connect(database=":memory:")
 
     # Input mode A: large-data friendly CSV path.
@@ -152,6 +153,7 @@ def harmonize_with_sql(
     FROM merged_data
     """
 
+    # Materialize CTE output back into pandas for downstream Python modeling.
     out = con.execute(query).fetchdf()
     return out
 
@@ -206,6 +208,7 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     score_df = lag_df.loc[rows_to_nowcast].copy()
 
     # Step 5) Run final nowcast model on selected rows.
+    # This is the single production forecasting rule selected by stress-test ranking.
     score_df["nowcast_pred"] = fit_predict_lag_hier_nowcast(
         train_data=train_df,
         score_data=score_df,
@@ -224,6 +227,7 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         target_col=TARGET_COL,
     )
 
+    # Intervals are empirical and relative (percent-like), so scale with the forecast magnitude.
     score_df = build_relative_prediction_intervals(
         calibration_df=calibration_df,
         prediction_df=score_df,
@@ -238,6 +242,7 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     )
 
     # Step 6) Build final revenue field and transparent status labels.
+    # Final table keeps both traceability fields and business-consumable outputs.
     final_df = work_df.copy()
     final_df["filled_revenue"] = final_df[TARGET_COL]
     final_df.loc[score_df.index, "filled_revenue"] = score_df["nowcast_pred"].values
@@ -343,6 +348,7 @@ def run_nowcast_and_audit(merged_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
 
 
 def main() -> None:
+    # Keep CLI minimal: one switch to refresh harmonized source, otherwise fast rerun from merged data.
     parser = argparse.ArgumentParser(
         description="Build Finance-ready revenue view (harmonize + nowcast + audit)",
     )
